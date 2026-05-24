@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
-<title>Marginalia — EPUB Reader</title>
+<title>Marginalia — EPUB Reader 2</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght,SOFT,WONK@9..144,300..900,0..100,0..1&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
@@ -1348,20 +1348,34 @@
 
   // ============== PREFETCH CACHE ==============
   // We fetch audio for upcoming chunks while the current one plays.
-  // Each entry is a Promise resolving to a blob URL (or rejecting on error).
+  // Requests are serialized via a queue — Puter limits concurrent TTS calls.
+  // Cache entries: sentIdx -> { status: 'pending'|'ready'|'failed', url?, error?, promise }
+  let prefetchQueue = Promise.resolve();
+
   function clearPrefetch() {
     if (!state.prefetch) return;
-    state.prefetch.forEach(p => {
-      // Best-effort revoke
-      Promise.resolve(p).then(url => { if (url && url.startsWith('blob:')) URL.revokeObjectURL(url); }).catch(()=>{});
+    state.prefetch.forEach(entry => {
+      if (entry.url && entry.url.startsWith('blob:')) {
+        try { URL.revokeObjectURL(entry.url); } catch(e) {}
+      }
     });
     state.prefetch.clear();
   }
 
   function prefetchChunk(idx) {
     if (idx < 0 || idx >= state.sentences.length) return null;
-    if (state.prefetch.has(idx)) return state.prefetch.get(idx);
     if (state.settings.engine === 'browser') return null;
+
+    const existing = state.prefetch.get(idx);
+    if (existing) {
+      // If a prior attempt failed, retry once when explicitly requested
+      if (existing.status === 'failed') {
+        log('retrying previously failed chunk', idx);
+        state.prefetch.delete(idx);
+      } else {
+        return existing.promise;
+      }
+    }
 
     const text = state.sentences[idx].text;
     const provider = state.settings.engine === 'puter-openai' ? 'openai'
@@ -1370,19 +1384,36 @@
     const opts = { provider };
     if (state.settings.puterVoice) opts.voice = state.settings.puterVoice;
 
-    const p = (async () => {
+    const entry = { status: 'pending' };
+    // Chain onto the queue so only one request is in flight at a time
+    entry.promise = prefetchQueue.then(async () => {
+      // Bail if this chunk has been invalidated (user jumped away)
+      if (!state.prefetch.has(idx) || state.prefetch.get(idx) !== entry) {
+        throw new Error('canceled');
+      }
+      log('fetch start chunk', idx, 'chars:', text.length);
       try {
         const audio = await puter.ai.txt2speech(text, opts);
-        // Puter returns an HTMLAudioElement with an internal src. Extract it.
-        // The src is typically a blob: or data: URL we can reuse.
+        entry.url = audio.src;
+        entry.status = 'ready';
+        log('fetch done chunk', idx);
         return audio.src;
       } catch(err) {
-        log('prefetch failed for chunk', idx, err.message || err);
+        entry.status = 'failed';
+        entry.error = err;
+        log('fetch failed chunk', idx, ':', err.message || err);
         throw err;
       }
-    })();
-    state.prefetch.set(idx, p);
-    return p;
+    });
+    // IMPORTANT: catch on prefetchQueue so one failure doesn't poison the whole chain
+    prefetchQueue = entry.promise.catch(() => {});
+
+    // Also attach a no-op catch to the entry promise so unhandled-rejection
+    // doesn't fire when consumers don't await it.
+    entry.promise.catch(() => {});
+
+    state.prefetch.set(idx, entry);
+    return entry.promise;
   }
 
   function schedulePrefetch() {
@@ -1390,11 +1421,12 @@
       prefetchChunk(state.currentSentIdx + i);
     }
     // Drop prefetched entries we've already passed
-    for (const k of state.prefetch.keys()) {
+    for (const k of Array.from(state.prefetch.keys())) {
       if (k < state.currentSentIdx) {
-        Promise.resolve(state.prefetch.get(k)).then(url => {
-          if (url && url.startsWith('blob:')) URL.revokeObjectURL(url);
-        }).catch(()=>{});
+        const entry = state.prefetch.get(k);
+        if (entry.url && entry.url.startsWith('blob:')) {
+          try { URL.revokeObjectURL(entry.url); } catch(e) {}
+        }
         state.prefetch.delete(k);
       }
     }
@@ -1408,22 +1440,25 @@
     }
     const idx = state.currentSentIdx;
     try {
-      // Capture which idx we're playing — if user jumps mid-fetch, abort
+      const entry = state.prefetch.get(idx);
       let srcUrl;
-      if (state.prefetch.has(idx)) {
-        log('cache hit for chunk', idx);
-        srcUrl = await state.prefetch.get(idx);
+      if (entry && entry.status === 'ready') {
+        log('cache hit (ready) for chunk', idx);
+        srcUrl = entry.url;
+      } else if (entry && entry.status === 'pending') {
+        log('cache hit (pending) for chunk', idx, '— awaiting');
+        srcUrl = await entry.promise;
       } else {
         log('cache miss, fetching chunk', idx, 'chars:', text.length);
         srcUrl = await prefetchChunk(idx);
       }
+
       if (!state.speaking || state.paused || state.currentSentIdx !== idx) {
         log('state changed during fetch, aborting playback for chunk', idx);
         return;
       }
 
       const audio = state.audioEl;
-      // Clean up previous listeners
       audio.onended = null;
       audio.onerror = null;
       audio.src = srcUrl;
@@ -1446,21 +1481,42 @@
         await audio.play();
       } catch(err) {
         log('audio.play() rejected on chunk', idx, ':', err.message);
-        // User-activation expired. Surface a one-time "tap to resume" prompt.
         if (err.name === 'NotAllowedError') {
           state.paused = true;
           setPlayIcon(false);
           errEl && (errEl.textContent = 'Tap play to resume');
-          // Show a centered resume button overlay
           showResumePrompt();
         } else {
           throw err;
         }
       }
     } catch(err) {
-      log('Puter TTS failed:', err.message || err);
+      const msg = err.message || String(err);
+      if (msg === 'canceled') return; // benign — user moved on
+      log('Puter TTS failed:', msg);
+
+      // Rate-limit handling: back off briefly and retry the same chunk once
+      const isRateLimit = /too many|rate|429/i.test(msg);
+      if (isRateLimit && !state._retried) {
+        state._retried = true;
+        log('rate limited — backing off 1.5s then retrying chunk', idx);
+        // Clear failed entry so it can be re-fetched
+        if (state.prefetch.get(idx)?.status === 'failed') state.prefetch.delete(idx);
+        setTimeout(() => {
+          state._retried = false;
+          if (state.speaking && !state.paused && state.currentSentIdx === idx) {
+            speakCurrent();
+          }
+        }, 1500);
+        return;
+      }
+      state._retried = false;
+
       stopSpeech();
-      alert('Cloud voice failed: ' + (err.message || err) + '\n\nIf this is your first cloud TTS request, Puter may have asked you to sign in. Tap play again after signing in.');
+      const userMsg = isRateLimit
+        ? 'Cloud voice is rate-limited. Wait a moment and tap play.'
+        : 'Cloud voice failed: ' + msg + '\n\nIf this is your first cloud request, Puter may have asked you to sign in. Tap play after signing in.';
+      alert(userMsg);
     }
   }
 
@@ -1652,4 +1708,3 @@
 </script>
 </body>
 </html>
-
